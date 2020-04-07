@@ -1,0 +1,597 @@
+---
+title: "BigMartSales"
+author: "Xiaoyi Chen"
+date: "2018/11/28"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+This is a knit report to predict sales of Big Mart. The dataset can be found [here](https://datahack.analyticsvidhya.com/contest/practice-problem-big-mart-sales-iii/). Firstly, we load packages required for the project.
+```{r,message=FALSE}
+## load packages
+library(data.table) # used for reading and manipulation of data
+library(dplyr)      # used for data manipulation and joining
+library(ggplot2)    # used for ploting 
+library(caret)      # used for modeling
+library(corrplot)   # used for making correlation plot
+library(xgboost)    # used for building XGBoost model
+library(cowplot)    # used for combining multiple plots 
+library(RColorBrewer) # used for setting colors
+library(ranger)
+```
+
+# Problem Overview
+
+The data scientists at BigMart have collected 2013 sales data for 1559 products across 10 stores in different cities. Also, certain attributes of each product and store have been defined. The aim is to build a predictive model and find out the sales of each product at a particular store. Using this model, BigMart will try to understand the properties of products and stores which play a key role in increasing sales. We have train (8523) and test (5681) data set, train data set has both input and output variable(s). We need to predict the sales for test data set. It's a regression problem.
+
+```{r}
+## read datasets
+setwd("/Users/monica/Documents/[Rutgers]Study/2018fall/AnalyticsBusIntell/GroupAssignment/Final")
+train = fread("data/train.csv")
+test = fread("data/test.csv")
+submission = fread("data/SampleSubmission.csv")[,-3]
+
+## train data dimension
+dim(train)
+## test data dimension
+dim(test)
+
+## train data column names
+names(train)
+## test data column names
+names(test)
+
+
+## structure of train data
+str(train)
+## structure of test data
+str(test)
+```
+As we can see, we have two identifiers, Item_Identifier and Outlet_Identifier, which uniquely identify each row together. We still have five categorical variables and five numeric variables. Item_Outlet_Sales only appears in train set, which is our target variable. We consider combine both train and test data sets into one, perform feature engineering and then divide them later again.
+
+```{r}
+
+test[,Item_Outlet_Sales := NA] ## add Item_Outlet_Sales to test data
+
+combi = rbind(train, test) # combining train and test datasets for data preprocessing
+
+```
+
+
+# Explorary Data Analysis (EDA)
+
+Now we will perform some basic data exploration. We divide the process into univariate and bivariate in order to explore the distribution of variables and relationship among them. **In this report, I will focus on technical process. Our data analyst will delve deeper into business insights.**
+
+## Univariate
+We will try to visualize the continuous variables using histograms and categorical variables using bar plots. The distributions of `Item_Outlet_Sales` and `Item_Visibility` are skewed, which means we should perform some transformation.
+```{r, fig.height=6, fig.width=8}
+# distribution of Item_Outlet_Sales
+ggplot(train) + 
+  geom_histogram(aes(train$Item_Outlet_Sales), binwidth = 100, fill = brewer.pal(7, "Set3")[6])+
+  xlab("Item_Outlet_Sales")
+
+# distribution of Item_Weight
+p1 = ggplot(combi) + 
+  geom_histogram(aes(Item_Weight), binwidth = 0.5, fill = brewer.pal(7, "Accent")[5])
+# distribution of Item_Weight
+p2 = ggplot(combi) +
+  geom_histogram(aes(Item_Visibility), binwidth = 0.005, fill = brewer.pal(7, "Accent")[5])
+# distribution of Item_Weight
+p3 = ggplot(combi) + geom_histogram(aes(Item_MRP), binwidth = 1, fill = brewer.pal(7, "Accent")[5])
+# put into one picture
+plot_grid(p1, p2, p3, nrow = 1) # plot_grid() from cowplot package
+```
+
+Note that there are a lot of unreasonably zeros in `Item_Visibility` variable. We can treat them as missing values.<br>
+For `Item_Fat_Content`, ‘LF’, ‘low fat’, and ‘Low Fat’ are the same category and can be combined into one, as well as ‘reg’ and ‘Regular’.
+```{r}
+# boxplot before combination
+ggplot(combi %>% group_by(Item_Fat_Content) %>% summarise(Count = n())) + 
+  geom_bar(aes(Item_Fat_Content, Count), stat = "identity", fill = brewer.pal(7, "Accent")[5])
+
+# combine the categories with the same meaning
+combi$Item_Fat_Content[combi$Item_Fat_Content == "LF"] = "Low Fat"
+combi$Item_Fat_Content[combi$Item_Fat_Content == "low fat"] = "Low Fat"
+combi$Item_Fat_Content[combi$Item_Fat_Content == "reg"] = "Regular"
+
+# boxplot after combination
+ggplot(combi %>% group_by(Item_Fat_Content) %>% summarise(Count = n())) + 
+  geom_bar(aes(Item_Fat_Content, Count), stat = "identity", fill = brewer.pal(7, "Set3")[6],width = 0.5)
+```
+
+Check other categorical variables. There are 4016 missing values in `Outlet_Size`. We need to impute them before modeling.
+```{r, fig.height=6, fig.width=8}
+# Item_Type
+p4 = ggplot(combi %>% group_by(Item_Type) %>% summarise(Count = n())) + 
+  geom_bar(aes(Item_Type, Count), stat = "identity", fill = brewer.pal(7, "Accent")[5]) +
+  xlab("") +
+  geom_label(aes(Item_Type, Count, label = Count), vjust = 0.5) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ggtitle("Item_Type")
+# Outlet_Identifier
+p5 = ggplot(combi %>% group_by(Outlet_Identifier) %>% summarise(Count = n())) + 
+  geom_bar(aes(Outlet_Identifier, Count), stat = "identity", fill = brewer.pal(7, "Set3")[6]) +
+  geom_label(aes(Outlet_Identifier, Count, label = Count), vjust = 0.5) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# Outlet_Size
+p6 = ggplot(combi %>% group_by(Outlet_Size) %>% summarise(Count = n())) + 
+  geom_bar(aes(Outlet_Size, Count), stat = "identity", fill = brewer.pal(7, "Set3")[6]) +
+  geom_label(aes(Outlet_Size, Count, label = Count), vjust = 0.5) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# put three plots together
+second_row = plot_grid(p5, p6, nrow = 1)
+plot_grid(p4, second_row, ncol = 1)
+
+# Outlet_Establishment_Year
+p7 = ggplot(combi %>% group_by(Outlet_Establishment_Year) %>% summarise(Count = n())) + 
+  geom_bar(aes(factor(Outlet_Establishment_Year), Count), 
+           stat = "identity", fill = brewer.pal(7, "Set3")[6]) +
+  geom_label(aes(factor(Outlet_Establishment_Year), Count, label = Count), vjust = 0.5) +
+  xlab("Outlet_Establishment_Year") +
+  theme(axis.text.x = element_text(size = 8.5))
+# plot for Outlet_Type
+p8 = ggplot(combi %>% group_by(Outlet_Type) %>% summarise(Count = n())) + 
+  geom_bar(aes(Outlet_Type, Count), stat = "identity", fill = brewer.pal(7, "Accent")[5]) +
+  geom_label(aes(factor(Outlet_Type), Count, label = Count), vjust = 0.5) +
+  theme(axis.text.x = element_text(size = 8.5))
+# plot both together
+plot_grid(p7, p8, ncol = 2)
+```
+
+## Bivariate
+
+For bivariate analysis, we hope to explore the relationship between predictors to the target (`Item_Outlet_Sales`). We will use scatter plots for numeric variables and violin plots for the categorical variables.
+
+```{r, fig.height=6, fig.width=8}
+train = combi[1:nrow(train)]
+
+# Item_Weight vs Item_Outlet_Sales
+p9 = ggplot(train) + 
+  geom_point(aes(Item_Weight, Item_Outlet_Sales), colour = brewer.pal(7, "GnBu")[6], alpha = 0.3) +
+     theme(axis.title = element_text(size = 8.5))
+# Item_Visibility vs Item_Outlet_Sales
+p10 = ggplot(train) + 
+  geom_point(aes(Item_Visibility, Item_Outlet_Sales), colour = brewer.pal(7, "GnBu")[6], alpha = 0.3) +
+      theme(axis.title = element_text(size = 8.5))
+# Item_MRP vs Item_Outlet_Sales
+p11 = ggplot(train) + 
+  geom_point(aes(Item_MRP, Item_Outlet_Sales), colour = brewer.pal(7, "GnBu")[6], alpha = 0.3) +
+      theme(axis.title = element_text(size = 8.5))
+# combine together
+second_row_2 = plot_grid(p10, p11, ncol = 2)
+plot_grid(p9, second_row_2, nrow = 2)
+```
+
+Note that in the plot of `Item_MRP` vs `Item_Outlet_Sales`, there are clearly 4 segments. We will use the observation later in feature engineering.
+
+```{r, fig.height=6, fig.width=8}
+# Item_Type vs Item_Outlet_Sales
+p12 = ggplot(train) + geom_violin(aes(Item_Type, Item_Outlet_Sales), fill = brewer.pal(7, "Set3")[6]) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text = element_text(size = 6),
+        axis.title = element_text(size = 8.5))
+# Item_Fat_Content vs Item_Outlet_Sales
+p13 = ggplot(train) + 
+  geom_violin(aes(Item_Fat_Content, Item_Outlet_Sales), fill = brewer.pal(7, "Set3")[6]) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8.5))
+# Outlet_Identifier vs Item_Outlet_Sales
+p14 = ggplot(train) + 
+  geom_violin(aes(Outlet_Identifier, Item_Outlet_Sales), fill = brewer.pal(7, "Set3")[6]) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8.5))
+# combine together
+second_row_3 = plot_grid(p13, p14, ncol = 2)
+plot_grid(p12, second_row_3, ncol = 1)
+
+# Outlet_Size vs Item_Outlet_Sales
+ggplot(train) + 
+  geom_violin(aes(Outlet_Size, Item_Outlet_Sales), fill = brewer.pal(7, "GnBu")[6])
+```
+
+In above plot, the distribution of `Item_Outlet_Sales` against blank size is identical with that against small size. So we consider impute the missing values in `Outlet_Size` with "Small".
+
+```{r, fig.height=6, fig.width=8}
+# Outlet_Location_Type vs Item_Outlet_Sales
+p15 = ggplot(train) + 
+  geom_violin(aes(Outlet_Location_Type, Item_Outlet_Sales), fill = brewer.pal(7, "Set3")[6])
+# Outlet_Type vs Item_Outlet_Sales
+p16 = ggplot(train) + 
+  geom_violin(aes(Outlet_Type, Item_Outlet_Sales), fill = brewer.pal(7, "Set3")[6])
+plot_grid(p15, p16, ncol = 1)
+```
+
+# Data Preprocessing
+
+Firstly, let's look at some basic statistics of attributes.  `Item_Outlet_Sales` is our target variable that we need to predict, namely the 5681 missing values in test set. Besides, we still have some missing values to impute. All categorical variables are characters. So we need to transform them into factor. However, there are too many factors, so we need to perform some feature engineering and encoding. 
+
+```{r}
+summary(combi)
+```
+
+## Missing Value Treatment
+There are 2439 missing values in `Item_Weight`, we impute them with the mean weight of the same product item. It makes sense because items of the same product usually have similiar or even the same weights.
+```{r}
+missing_index = which(is.na(combi$Item_Weight))
+for(i in missing_index){
+  item = combi$Item_Identifier[i]
+  combi$Item_Weight[i] = mean(combi$Item_Weight[combi$Item_Identifier == item], na.rm = T)
+}
+# Check if there is still any missing data in Item_Weight.
+sum(is.na(combi$Item_Weight))
+```
+
+Similiarly, we treat zeros in `Item_Visibility` as missing values and impute them with the mean value of the same product.
+```{r}
+# replacing 0 in Item_Visibility with mean
+zero_index = which(combi$Item_Visibility == 0)
+for(i in zero_index){
+  item = combi$Item_Identifier[i]
+  combi$Item_Visibility[i] = mean(combi$Item_Visibility[combi$Item_Identifier == item], na.rm = T)
+}
+# Check the distribution of Item_Visibility
+ggplot(combi) + geom_histogram(aes(Item_Visibility), bins = 100,fill = brewer.pal(7, "Accent")[5])
+```
+
+## Feature Engineering
+Some categorical variables have so many categories that it's impossible to fit models on them. So we can extract some information related to sales prediction and create some new features to replace them. Firstly, we can look at the `Item_Type` variable and create a new variable to classify the type categories into perishable and non_perishable.
+```{r}
+# create a new feature 'Item_Type_new' (replacing Item_Type)
+table(combi$Item_Type)
+perishable = c("Breads", "Breakfast", "Dairy", "Fruits and Vegetables", "Meat", "Seafood")
+non_perishable = c("Baking Goods", "Canned", "Frozen Foods", "Hard Drinks", "Health and Hygiene",
+                   "Household", "Soft Drinks")
+combi[,Item_Type_new := ifelse(Item_Type %in% perishable, "perishable",
+                               ifelse(Item_Type %in% non_perishable, "non_perishable", "not_sure"))]
+```
+
+We find that the first two characters of `Item_Identifier` are "DR", "FR" and "NC", which may probably represent drink, fruite and non-consumable. We compare these two characters with `Item_Type`, which validates our assumption. So we create another variable `Item_category`. In this way, it is unreasonable to have "NC" items with "low fat", so we change it to "Non-Edible". We also create two more features: `Outlet_Years` and `price_per_unit_wt`.
+
+```{r}
+# compare 'Item_Type' with the first two characters of 'Item_Identifier'
+table(combi$Item_Type, substr(combi$Item_Identifier, 1, 2))
+# create a new feature 'Item_category'
+combi[,Item_category := substr(combi$Item_Identifier, 1, 2)]
+
+# change the 'Item_Fat_Content' value for items in "NC" category
+combi$Item_Fat_Content[combi$Item_category == "NC"] = "NonEdible"
+
+# years of operation of outlets (replacing 'Outlet_Establishment_Year')
+combi[,Outlet_Years := 2013 - Outlet_Establishment_Year]
+combi$Outlet_Establishment_Year = as.factor(combi$Outlet_Establishment_Year)
+
+# Price per unit weight
+combi[,price_per_unit_wt := Item_MRP/Item_Weight]
+```
+In the EDA section, we have found that there are four segmentations in `Item_MRP` vs `Item_Outlet_Sales` plot. So we create a new variable `Item_MRP_Clusters` with four categories. 
+```{r}
+# creating new independent variable 'Item_MRP_clusters'
+combi[,Item_MRP_clusters := ifelse(Item_MRP < 69, "1st", 
+                                   ifelse(Item_MRP >= 69 & Item_MRP < 136, "2nd",
+                                          ifelse(Item_MRP >= 136 & Item_MRP < 203, "3rd", "4th")))]
+```
+
+## Category Encoding
+Most of the machine learning algorithms produce better result with numerical variables only. So we convert categorical variables into numerical ones through two encoding techniques, label encoding and one hot encoding. Label encoding simply converts each category in a variable to a number. It is more suitable for ordinal variables. Categorical variables with some order. One hot encoding convert each category  into a new binary column (1/0).
+```{r}
+## Label Encoding
+combi[,Outlet_Size_num := ifelse(Outlet_Size == "Small", 0,
+                                 ifelse(Outlet_Size == "Medium", 1, 2))]
+combi[,Outlet_Location_Type_num := ifelse(Outlet_Location_Type == "Tier 3", 0,
+                                          ifelse(Outlet_Location_Type == "Tier 2", 1, 2))]
+# remove categorical variables after label encoding
+combi[, c("Outlet_Size", "Outlet_Location_Type") := NULL]
+
+## One Hot Encoding
+ohe = dummyVars("~.", data = combi[,-c("Item_Identifier", "Outlet_Establishment_Year", "Item_Type")], fullRank = T)
+ohe_df = data.table(predict(ohe, combi[,-c("Item_Identifier", "Outlet_Establishment_Year", "Item_Type")]))
+combi = cbind(combi[,"Item_Identifier"], ohe_df)
+```
+
+## Variable transformation
+For variables with skewed distributions, we consider transform them by taking log.
+```{r}
+combi[,Item_Visibility := log(Item_Visibility + 1)] # log + 1 to avoid division by zero
+ggplot(combi) +
+  geom_histogram(aes(Item_Visibility), binwidth = 0.005, fill = brewer.pal(7, "Accent")[5])
+combi[,price_per_unit_wt := log(price_per_unit_wt + 1)]
+ggplot(combi) +
+  geom_histogram(aes(price_per_unit_wt), binwidth = 0.005, fill = brewer.pal(7, "Accent")[5])
+```
+
+# Scaling and Centering
+We hope to scale and center the numeric variables to make them have a mean of zero, standard deviation of one and scale of 0 to 1. Scaling and centering is required for linear regression models. 
+```{r}
+# only for numerical variables
+num_vars = which(sapply(combi, is.numeric))
+num_vars_names = names(num_vars)
+# exclude the target variable
+combi_numeric = combi[,setdiff(num_vars_names, "Item_Outlet_Sales"), with = F]
+
+# scaling and centering data
+prep_num = preProcess(combi_numeric, method=c("center", "scale"))
+combi_numeric_norm = predict(prep_num, combi_numeric)
+
+combi[,setdiff(num_vars_names, "Item_Outlet_Sales") := NULL] # removing numeric independent variables
+combi = cbind(combi, combi_numeric_norm)
+
+# splitting data back to train and test
+train = combi[1:nrow(train)]
+test = combi[(nrow(train) + 1):nrow(combi)]
+test[,Item_Outlet_Sales := NULL] # removing Item_Outlet_Sales as it contains only NA for test dataset
+fwrite(train,"data/modified_train.csv")
+fwrite(test,"data/modified_test.csv")
+```
+
+## Correlation Plot
+```{r, fig.height=8, fig.width=8}
+cor_train = cor(train[,-c("Item_Identifier")])
+corrplot(cor_train, type = "lower",method="pie", tl.pos = "ld",
+         tl.cex = 0.8,tl.col=brewer.pal(7, "Accent")[5])
+#corrplot(cor_train, add= TRUE, type = "upper", tl.pos = "n",cl.pos="n", 
+#         method = "number",tl.cex = 0.8,tl.col=brewer.pal(7, "Accent")[5])
+
+```
+
+# Modeling
+
+We apply the following models:<br>
+* Linear regression
+* Lasso Regression
+* Ridge Regression
+* RandomForest
+* XGBoost
+
+To evaluate the model, we calculate the root mean squared error (RMSE) score for each model and compare the score with the baseline model. The smaller the score, the better our model will be. Our baseline model predicts the sale as overall average sale.
+
+```{r}
+train<-fread("data/modified_train.csv")
+test<-fread("data/modified_test.csv")
+submission$Item_Outlet_Sales = mean(train[['Item_Outlet_Sales']])
+fwrite(submission, "data/Baseline_submit.csv", row.names = F)
+# rmse score
+ sqrt(mean((mean(train[['Item_Outlet_Sales']])-train[['Item_Outlet_Sales']])^2))
+```
+
+
+## Linear Regression
+Firstly, we fit a multiple linear regression model and use backward elimination method to cut off insignificant predictors.
+```{r, message= FALSE}
+linear_reg_mod = lm(Item_Outlet_Sales ~ ., data = train[,-c("Item_Identifier")])
+summary(linear_reg_mod)
+
+## predicting on test set and writing a submission file
+submission$Item_Outlet_Sales = predict(linear_reg_mod, test[,-c("Item_Identifier")])
+# fwrite(submission, "data/Linear_Reg_submit.csv", row.names = F)
+
+# rmse score for train set
+sqrt(mean((fitted(linear_reg_mod)-train[['Item_Outlet_Sales']])^2))
+```
+When we plot the coefficients, we can see there are several missing values results from multicolinearity.
+```{r}
+coef<-data.frame(linear_reg_mod$coefficients,names(linear_reg_mod$coefficients))
+ colnames(coef)<-c("coefficient","attribute")
+ #coef[is.na(coef)]<-0
+ coef<-coef[order(coef$coefficient),]
+ a<-rownames(coef)
+ coef$attribute=factor(coef$attribute,levels=a)
+ ggplot(coef[-nrow(coef),],aes(x=attribute,y=coefficient))+
+   geom_bar(stat='identity', fill = brewer.pal(7, "Set3")[6],width = 0.5)+
+   theme(axis.text.x = element_text(size=6,angle = 90),axis.text.y = element_text(size=6))
+ 
+```
+
+## Penalty-Based Variable Selection in Regression Models
+Since the regression model has a large number of covariates as well as categorical variables, we consider some penalty-based estimation approaches to handle the correlated predictors and to get rid of overfitting. The first method is least absolute shrinkage and selection operator (LASSO) algorithm. Through applying a penalty parameter to constrain the sum of absolute coefficients, LASSO can shrinkage the estimates and lead to variable selection and a simplification of the model. Large values of penalty parameter lead to large shrinkage and small values result in little shrinkage. Therefore, we need to select the penalty parameter. Here we use 5-fold cross validation.
+```{r}
+set.seed(1235)
+my_control = trainControl(method="cv", number=5)
+# select penalty parameter from 0.001 to 0.1
+Grid = expand.grid(alpha = 1, lambda = seq(0,10,by = 0.01))
+# train model through 5-fold cross validation
+lasso_linear_reg_mod = train(x = train[, -c("Item_Identifier", "Item_Outlet_Sales")], 
+                             y = train$Item_Outlet_Sales,
+                             method='glmnet', trControl= my_control, tuneGrid = Grid)
+
+# rmse score for train set
+(rmse_lasso=mean(lasso_linear_reg_mod$resample$RMSE))
+## predicting on test set and writing a submission file
+submission$Item_Outlet_Sales = predict(lasso_linear_reg_mod, test[,-c("Item_Identifier")])
+#fwrite(submission, "data/Lasso_Reg_submit.csv", row.names = F)
+
+# plot parameter tuning
+plot(lasso_linear_reg_mod)
+
+# plot coefficients
+a<-coef(lasso_linear_reg_mod$finalModel)[,69]
+coef<-data.frame(a,names(a))
+ colnames(coef)<-c("coefficient","attribute")
+ coef[is.na(coef)]<-0
+ coef<-coef[order(coef$coefficient),]
+ a<-rownames(coef)
+ coef$attribute=factor(coef$attribute,levels=a)
+ ggplot(coef[-nrow(coef),],aes(x=attribute,y=coefficient))+
+   geom_bar(stat='identity', fill = brewer.pal(7, "Set3")[6],width = 0.5)+
+   theme(axis.text.x = element_text(size=6,angle = 90),axis.text.y = element_text(size=6))
+
+ # plot importance of predictors 
+plot(varImp(lasso_linear_reg_mod))
+```
+
+Ridge Regression is similiar to LASSO except that it limits the sum of squared coefficients rather than absolute coefficients.
+```{r}
+set.seed(1235)
+my_control = trainControl(method="cv", number=5)
+# select penalty parameter from 0.001 to 0.1
+Grid = expand.grid(alpha = 0, lambda = seq(0,20,by = 0.1))
+# train model through 5-fold cross validation
+ridge_linear_reg_mod = train(x = train[, -c("Item_Identifier", "Item_Outlet_Sales")], 
+                             y = train$Item_Outlet_Sales,
+                             method='glmnet', trControl= my_control, tuneGrid = Grid)
+
+# rmse score for train set
+(rmse_ridge=mean(ridge_linear_reg_mod$resample$RMSE))
+
+
+a<-coef(ridge_linear_reg_mod$finalModel)[,100]
+coef<-data.frame(a,names(a))
+ colnames(coef)<-c("coefficient","attribute")
+ coef[is.na(coef)]<-0
+ coef<-coef[order(coef$coefficient),]
+ a<-rownames(coef)
+ coef$attribute=factor(coef$attribute,levels=a)
+ ggplot(coef[-nrow(coef),],aes(x=attribute,y=coefficient))+
+   geom_bar(stat='identity', fill = brewer.pal(7, "Set3")[6],width = 0.5)+
+   theme(axis.text.x = element_text(size=6,angle = 90),axis.text.y = element_text(size=6))
+
+ # plot importance of coefficients
+plot(varImp(ridge_linear_reg_mod))
+
+
+## predicting on test set and writing a submission file
+submission$Item_Outlet_Sales = predict(ridge_linear_reg_mod, test[,-c("Item_Identifier")])
+#fwrite(submission, "data/Ridge_Reg_submit.csv", row.names = F)
+```
+
+## RandomForest Model
+We build a RandomForest model with 400 trees and run 5-fold cross validation to select some tuning parameters including `mtry` (no. of predictor variables randomly sampled at each split) and `min.node.size` (minimum size of terminal nodes).
+```{r}
+set.seed(1237)
+my_control = trainControl(method="cv", number=5)
+
+tgrid = expand.grid(
+  .mtry = c(3:10),
+  .splitrule = "variance",
+  .min.node.size =c(10,15,20)
+)
+
+# rf_start_time<-Sys.time()
+# 
+# rf_mod = train(x = train[, -c("Item_Identifier", "Item_Outlet_Sales")],
+#               y = train$Item_Outlet_Sales,
+#               method='ranger',
+#               trControl= my_control,
+#               tuneGrid = tgrid,
+#               num.trees = 400,
+#               importance = "permutation")
+# rf_end_time<-Sys.time()
+# (rf_time<-rf_end_time-rf_start_time)
+# 
+# save(rf_mod, file="data/rf_mod.Rdata")
+load("data/rf_mod.Rdata")
+
+# rmse score
+(mean(rf_mod$resample$RMSE))
+## plot displaying RMSE scores for different tuning parameters
+plot(rf_mod)
+
+## plot variable importance
+plot(varImp(rf_mod))
+
+# show the results of parameter selection
+# number of predictors
+rf_mod$bestTune$mtry
+# minimum node size
+rf_mod$bestTune$min.node.size
+
+## predicting on test set and writing a submission file
+submission$Item_Outlet_Sales = predict(rf_mod, test[,-c("Item_Identifier")])
+# fwrite(submission, "data/Rf_submit.csv", row.names = F)
+```
+
+## XGBoost
+XGBoost is an advanced gradient boosting algorithm which consider a tradeoff between prediction loss and complexity in a fast way. It combines several week learners to form a strong learner through an iterative process. Initially, the algorithm starts from a single base leaner and add a new learner in each iterative based on the residuals of previous learners. So the iterative process is sequencial which may cost much time to converge. However, XGBoost implements parallel computing to ensure time efficiency. Both linear model and tree models can be served as a base learner. Here we choose gbtree by default because tree models usually perfom better. Moreover, we can run a cross-validation at each iteration to get the exact optimum number of boosting iterations in a single run.
+```{r}
+## List of initial parameters for XGBoost modeling
+param_list = list(
+        objective = "reg:linear",# regression problem
+        eta=0.1,# learning rate, shrinks the feature weights to reduce complexity
+        gamma = 0, # the minimum loss reduction required to make a split
+        max_depth=5,# maximum depth of each tree
+        subsample=0.8,# subsample percentage for training each tree
+        colsample_bytree=0.8,#percentage of features selected randomly for training each tree
+        seed = 112
+        )
+
+## converting train and test into xgb.DMatrix format
+dtrain = xgb.DMatrix(data = as.matrix(train[,-c("Item_Identifier", 
+                                                "Item_Outlet_Sales")]), 
+                     label= train$Item_Outlet_Sales)
+dtest = xgb.DMatrix(data = as.matrix(test[,-c("Item_Identifier")]))
+
+## 5-fold cross-validation to find optimal value of nrounds
+set.seed(112)
+xgb_start_time <- Sys.time()
+xgbcv = xgb.cv(params = param_list, 
+               data = dtrain, 
+               nrounds = 1000, # maximun number of iteration
+               nfold = 5, 
+               print_every_n = 1000000, 
+               early_stopping_rounds = 30, # stop if the performance doesn't improve for 30 rounds
+               maximize = F)
+xgbcv$best_iteration
+
+## training XGBoost model at nrounds = 430
+xgb_model = xgb.train(data = dtrain, 
+                      params = param_list,
+                      watchlist <- list(train=dtrain),
+                      print_every_n = 100000,
+                      nrounds = xgbcv$best_iteration)
+
+# rmse score for train set
+(rmse_xgb=xgb_model$evaluation_log$train_rmse[xgbcv$best_iteration])
+
+## Variable Importance
+var_imp = xgb.importance(feature_names = setdiff(names(train), c("Item_Identifier", "Item_Outlet_Sales")), 
+                         model = xgb_model)
+xgb.plot.importance(var_imp)
+```
+
+From the above result, we can find that the train performance by XGBoost is outstanding (The rmse score is 1012). However, the result is unreliabel because we only run the program onece and the test performance on the LeaderBoard is not ideal (only 1202, worse than random forest). So we consider run a cross validation to tune parameters and obtain a reliable estimation. We use grid search method to find the optimal parameters.
+
+```{r}
+
+# set up the cross-validated hyper-parameter search
+xgb_grid = expand.grid(
+  nrounds = 42,
+  eta=0.1,# learning rate; the smaller, the more conservative
+  max_depth = 3:10,# maximum depth of each tree; the smaller, the more conservative
+  min_child_weight=5:11,# the larger, the more conservative
+  gamma = 0,# the minimum loss reduction required to make a split; the larger, the more conservative
+  subsample=0.8, # subsample percentage for training each tree; the smaller, the more conservative
+  colsample_bytree=0.8#percentage of features selected randomly for training each tree; the smaller, the more conservative
+  )
+# pack the training control parameters
+xgb_trcontrol_1 = trainControl(
+  method = "cv",
+  number = 5,
+  allowParallel = TRUE
+)
+
+# train the model for each parameter combination in the grid, 
+#   using CV to evaluate
+xgb_start_time=Sys.time()
+set.seed(112)
+xgb_train = train(
+  x = train[, -c("Item_Identifier", "Item_Outlet_Sales")],
+  y = train$Item_Outlet_Sales,
+  trControl = xgb_trcontrol_1,
+  tuneGrid = xgb_grid,
+  method = "xgbTree"
+)
+xgb_end_time=Sys.time()
+(xgb_time<-xgb_end_time-xgb_start_time)
+
+# prediction
+set.seed(112)
+submission$Item_Outlet_Sales = predict(xgb_train, test[,-c("Item_Identifier")])
+#fwrite(submission, "data/Xgb__.csv", row.names = F)
+
+# calculate rmse score
+mean(xgb_train$resample$RMSE)
+```
+
+This time the rmse score is 1088 and the test score on the LeaderBoard is 1157. The score is very much better than before and close to random forest. However, the performance is still worse than random forest. It's probably because we havn't pruned parameters of XGBoost appropriatly. We will perform more grid search in futher study.
