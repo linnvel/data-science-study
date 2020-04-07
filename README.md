@@ -5,7 +5,7 @@ The specific projects include:
 
 1. Image classification for Fashion Mnist dataset using Logistic Regression, ANN and CNN. (Python)
 
-2. Image Classification for Digit Mnist dataset using graph analysis and clustering analysis. (Python)
+2. Image Classification for Digit Mnist dataset using classification algorithms, graph analysis and clustering analysis. (Python)
 
 3. Implementation of recommendation system for MovieLens dataset including collaborative filtering and matrix factorization. (Python)
 
